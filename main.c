@@ -3,6 +3,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
+
+struct thread_args {
+    int sock_fd;
+    struct sockaddr_in client_address;
+    socklen_t client_addr_len;
+    ssize_t bytes_received;
+    unsigned char packet[65536];
+};
 
 struct DNS_HEADER {  // RFC1035 4.1.1
   unsigned short id; // identification number
@@ -45,7 +54,8 @@ struct DNS_RR_FLAGS { // Resource record format RFC1035 4.1.3
   unsigned char
       packet[65536]; // part of the packet with answers; change size to malloc?
   unsigned int packet_size; // size of the packet with answers
-  unsigned int an_count;    // count of answers
+  struct DNS_HEADER header;
+  unsigned short RC;
 };
 
 struct DNS_HEADER_FLAGS parse_header_flags(unsigned short flags) {
@@ -272,14 +282,200 @@ struct DNS_RR_FLAGS resolve(const char *query, const char *dns_server) {
   // parsing RRs from reply
   printf("Parcing RRs from reply...\n");
   struct DNS_RR_FLAGS answer_record;
-  answer_record.an_count = response_header.an_count;
-
+  answer_record.header.an_count = response_header.an_count;
+  answer_record.header.ns_count = response_header.ns_count;
+  answer_record.header.ar_count = response_header.ar_count;
+  answer_record.RC = header_flags.RC;
   answer_record.packet_size = 0;
+  printf("Received packet size: %d\n", received_packet_size);
   for (int i = 12, j = 0; i < received_packet_size; i++) {
     answer_record.packet[j++] = packet[i];
     answer_record.packet_size++;
   }
   return answer_record;
+}
+
+// Define a function to handle client requests
+void *handle_request(void *args) {
+  struct thread_args *thread_args = (struct thread_args *)args;
+  int sock_fd = thread_args->sock_fd;
+  struct sockaddr_in client_address = thread_args->client_address;
+  socklen_t client_addr_len = thread_args->client_addr_len;
+  if (thread_args->bytes_received == -1) {
+    printf("Recvfrom failed.\n");
+    close(sock_fd);
+    exit(EXIT_FAILURE);
+  }
+
+  thread_args->packet[thread_args->bytes_received] = '\0';
+  printf("Received from %s:%d\n", inet_ntoa(client_address.sin_addr),
+         ntohs(client_address.sin_port));
+
+  struct DNS_HEADER request_header;
+  request_header.id = 0;
+  request_header.id |= thread_args->packet[1];
+  request_header.id <<= 8;
+  request_header.id |= thread_args->packet[0];
+
+  request_header.flags = 0;
+  request_header.flags |= thread_args->packet[2];
+  request_header.flags <<= 8;
+  request_header.flags |= thread_args->packet[3];
+
+  struct DNS_HEADER_FLAGS flags = parse_header_flags(request_header.flags);
+
+  request_header.qd_count = 0;
+  request_header.qd_count |= thread_args->packet[4];
+  request_header.qd_count <<= 8;
+  request_header.qd_count |= thread_args->packet[5];
+  printf("Questions count: %d\n", request_header.qd_count);
+
+  request_header.an_count = 0;
+  request_header.an_count |= thread_args->packet[6];
+  request_header.an_count <<= 8;
+  request_header.an_count |= thread_args->packet[7];
+  printf("Answers count: %d\n", request_header.an_count);
+
+  request_header.ns_count = 0;
+  request_header.ns_count |= thread_args->packet[8];
+  request_header.ns_count <<= 8;
+  request_header.ns_count |= thread_args->packet[9];
+  printf("Authority RRs count: %d\n", request_header.ns_count);
+
+  request_header.ar_count = 0;
+  request_header.ar_count |= thread_args->packet[10];
+  request_header.ar_count <<= 8;
+  request_header.ar_count |= thread_args->packet[11];
+  printf("Additional RRs count: %d\n", request_header.ar_count);
+
+  if (flags.Z == 0)
+    printf("Z: is zero, continiuing.\n");
+  else {
+    printf("Z: Z is 1, package corrupted.\n"); // TODO send refused instead?
+  }
+
+  if (flags.QR == 0) {
+    printf("QR: Message is query.\n");
+    switch (flags.op_code) {
+    case 0:
+      printf("OPCODE: 0, a standard query\n"); // Send to relay and return IP
+      if (request_header.qd_count != 0) {
+        int size_of_cname = 1;
+        for (int j = 12; thread_args->packet[j] != 0; j++) {
+            size_of_cname++;
+        }
+        unsigned char cname[size_of_cname];
+        unsigned char *cname_ptr = &cname[0];
+        for (int j = 12; j < 12 + size_of_cname; j++) {
+            *cname_ptr++ = thread_args->packet[j];
+        }
+        change_to_dot_format(cname);
+        printf("CNAME: %s\n", cname);
+
+        // TODO: Add blacklist checking
+
+        // got CNAME, sending to RELAY
+        struct DNS_RR_FLAGS answer_record = resolve(cname, "8.8.8.8");
+        printf("IP: %s\n", answer_record.ip);
+
+        free(answer_record.ip);
+
+        // building a response
+        request_header.an_count = answer_record.header.an_count;
+        flags.QR = 1; // response
+        flags.RA = 1; // recursion is available
+        flags.RC = answer_record.RC;
+        unsigned char *response_packet, *response_packet_start;
+        response_packet = malloc(1024);
+        memset(response_packet, 0, 1024);
+        response_packet_start = response_packet;
+
+        response_packet[0] = request_header.id & 0b11111111;// id
+        response_packet[1] = (request_header.id >> 8) & 0b11111111;
+
+        response_packet += 2;
+
+        unsigned short flags_bits = flags_to_header(flags);
+        response_packet[0] = (flags_bits >> 8) & 0b11111111;
+        response_packet[1] = flags_bits & 0b11111111;
+        response_packet += 2;
+
+        response_packet[0] = thread_args->packet[4]; // questions
+        response_packet[1] = thread_args->packet[5];
+        response_packet += 2;
+
+        response_packet[0] = 0; // answers
+        response_packet[1] = answer_record.header.an_count;
+        response_packet += 2;
+
+        response_packet[0] = 0; // authority RRs
+        response_packet[1] = answer_record.header.ns_count;
+        response_packet += 2;
+
+        response_packet[0] = 0; // additional RRs
+        response_packet[1] = answer_record.header.ar_count;
+        response_packet += 2;
+
+        for (int j = 0; j < answer_record.packet_size; j++) { // copying answer from relay dns response
+            response_packet[0] = answer_record.packet[j];
+            response_packet++;
+        }
+        printf("Sending result\n");
+        printf("size: %d\n", (int)(response_packet - response_packet_start));
+        ssize_t bytes_sent =
+            sendto(thread_args->sock_fd, response_packet_start,
+                   response_packet - response_packet_start, 0,
+                   (struct sockaddr *)&thread_args->client_address, thread_args->client_addr_len);
+        if (bytes_sent == -1) {
+            perror("Sendto failed");
+        }
+      }
+      break;
+    case 1:
+      printf("OPCODE: 1, an inverse query\n");
+      break;
+    case 2:
+      printf("OPCODE: 2, a server status request\n");
+      break;
+    case 3:
+    case 4:
+    case 5:
+    case 6:
+    case 7:
+    case 8:
+    case 9:
+    case 10:
+    case 11:
+    case 12:
+    case 13:
+    case 14:
+    case 15:
+      printf("OPCODE: %d, reserved for future use\n", flags.op_code);
+      break;
+    default:
+      break;
+    }
+  } else {
+    printf("QR: Message is response.\n"); // TODO send refused?
+  }
+
+  if (flags.TC == 0)
+    printf("TC: Message is NOT truncated.\n");
+  else
+    printf("TC: Message is truncated.\n");
+
+  if (flags.RD == 0)
+    printf("RD: Recursion not desired.\n");
+  else
+    printf("RD: Recursion desired.\n");
+
+  // Remember to free any allocated resources and close the socket if needed
+
+  // Free the memory allocated for thread arguments
+  free(thread_args);
+
+  // Exit the thread
+  pthread_exit(NULL);
 }
 
 void server() {
@@ -299,188 +495,48 @@ void server() {
 
   if (bind(sock_fd, (struct sockaddr *)&server_address,
            sizeof(server_address)) == -1) {
-    printf("Bind failed.\n");
+    perror("Bind failed");
     close(sock_fd);
     exit(EXIT_FAILURE);
   }
 
   printf("Listening on port 53...\n");
-  unsigned char packet[65536];
-  struct sockaddr_in client_address;
-  socklen_t client_addr_len = sizeof(client_address);
+
 
   while (1) {
-    ssize_t bytes_received =
-        recvfrom(sock_fd, packet, 65536, 0, (struct sockaddr *)&client_address,
-                 &client_addr_len);
+    // Receive request from client
+    unsigned char packet[65536];
+    struct sockaddr_in client_address;
+    socklen_t client_addr_len = sizeof(client_address);
+    ssize_t bytes_received = recvfrom(sock_fd, packet, sizeof(packet), 0, (struct sockaddr *)&client_address, &client_addr_len);
     if (bytes_received == -1) {
-      printf("Recvfrom failed.\n");
-      close(sock_fd);
-      exit(EXIT_FAILURE);
+      perror("recvfrom failed");
+      continue;
     }
 
-    packet[bytes_received] = '\0';
-    printf("Received from %s:%d\n", inet_ntoa(client_address.sin_addr),
-           ntohs(client_address.sin_port));
+    // Create thread arguments
+    struct thread_args *thread_args = malloc(sizeof(struct thread_args));
+    if (thread_args == NULL) {
+      perror("Memory allocation failed");
+      continue;
+    }
+    thread_args->sock_fd = sock_fd;
+    thread_args->bytes_received = bytes_received;
+    thread_args->client_address = client_address;
+    thread_args->client_addr_len = client_addr_len;
+    memcpy(&thread_args->packet, &packet, sizeof(packet));
 
-    struct DNS_HEADER request_header;
-    request_header.id = 0;
-    request_header.id |= packet[1];
-    request_header.id <<= 8;
-    request_header.id |= packet[0];
-
-    request_header.flags = 0;
-    request_header.flags |= packet[2];
-    request_header.flags <<= 8;
-    request_header.flags |= packet[3];
-
-    struct DNS_HEADER_FLAGS flags = parse_header_flags(request_header.flags);
-
-    request_header.qd_count = 0;
-    request_header.qd_count |= packet[4];
-    request_header.qd_count <<= 8;
-    request_header.qd_count |= packet[5];
-    printf("Questions count: %d\n", request_header.qd_count);
-
-    request_header.an_count = 0;
-    request_header.an_count |= packet[6];
-    request_header.an_count <<= 8;
-    request_header.an_count |= packet[7];
-    printf("Answers count: %d\n", request_header.an_count);
-
-    request_header.ar_count = 0;
-    request_header.ar_count |= packet[8];
-    request_header.ar_count <<= 8;
-    request_header.ar_count |= packet[9];
-    printf("Authority RRs count: %d\n", request_header.ar_count);
-
-    request_header.ns_count = 0;
-    request_header.ns_count |= packet[10];
-    request_header.ns_count <<= 8;
-    request_header.ns_count |= packet[11];
-    printf("Additional RRs count: %d\n", request_header.ns_count);
-
-    if (flags.Z == 0)
-      printf("Z: is zero, continiuing.\n");
-    else {
-      printf("Z: Z is 1, package corrupted.\n"); // TODO send refused instead?
+    // Create a new thread to handle the request
+    pthread_t tid;
+    int ret = pthread_create(&tid, NULL, handle_request, (void *)thread_args);
+    if (ret != 0) {
+      perror("Thread creation failed");
+      free(thread_args);
+      continue;
     }
 
-
-
-    if (flags.QR == 0) {
-      printf("QR: Message is query.\n");
-      switch (flags.op_code) {
-      case 0:
-        printf("OPCODE: 0, a standard query\n"); // Send to relay and return IP
-        if (request_header.qd_count != 0) {
-          int size_of_cname = 1;
-          for (int j = 12; packet[j] != 0; j++) {
-            size_of_cname++;
-          }
-          unsigned char cname[size_of_cname];
-          unsigned char *cname_ptr = &cname[0];
-          for (int j = 12; j < 12 + size_of_cname; j++) {
-            *cname_ptr++ = packet[j];
-          }
-          change_to_dot_format(cname);
-          printf("CNAME: %s\n", cname);
-
-          // TODO: Add blacklist checking
-
-          // got CNAME, sending to RELAY
-          struct DNS_RR_FLAGS answer_record = resolve(cname, "8.8.8.8");
-          printf("IP: %s\n", answer_record.ip);
-
-          free(answer_record.ip);
-
-          // building a response
-          request_header.an_count = answer_record.an_count;
-          flags.QR = 1; // response
-          flags.RA = 1; // recursion is available
-          unsigned char *response_packet, *response_packet_start;
-          response_packet = malloc(1024);
-          memset(response_packet, 0, 1024);
-          response_packet_start = response_packet;
-
-          response_packet[0] = request_header.id & 0b11111111;// id
-          response_packet[1] = (request_header.id >> 8) & 0b11111111;
-
-          response_packet += 2;
-
-          unsigned short flags_bits = flags_to_header(flags);
-          response_packet[0] = (flags_bits >> 8) & 0b11111111;
-          response_packet[1] = flags_bits & 0b11111111;
-          response_packet += 2;
-
-          response_packet[0] = packet[4]; // questions
-          response_packet[1] = packet[5];
-          response_packet += 2;
-
-          response_packet[0] = 0; // answers
-          response_packet[1] = answer_record.an_count; //What if > 255?
-          response_packet += 2;
-
-          response_packet[0] = 0; // authority RRs
-          response_packet[1] = 0;
-          response_packet += 2;
-
-          response_packet[0] = 0; // additional RRs
-          response_packet[1] = 0;
-          response_packet += 2;
-
-          for (int j = 0; j < answer_record.packet_size; j++) { // copying answer from relay dns response
-            response_packet[0] = answer_record.packet[j];
-            response_packet++;
-          }
-          printf("Sending result\n");
-          printf("size: %d\n", (int)(response_packet - response_packet_start));
-          ssize_t bytes_sent =
-              sendto(sock_fd, response_packet_start,
-                     response_packet - response_packet_start, 0,
-                     (struct sockaddr *)&client_address, client_addr_len);
-          if (bytes_sent == -1) {
-            perror("Sendto failed");
-          }
-        }
-        break;
-      case 1:
-        printf("OPCODE: 1, an inverse query\n");
-        break;
-      case 2:
-        printf("OPCODE: 2, a server status request\n");
-        break;
-      case 3:
-      case 4:
-      case 5:
-      case 6:
-      case 7:
-      case 8:
-      case 9:
-      case 10:
-      case 11:
-      case 12:
-      case 13:
-      case 14:
-      case 15:
-        printf("OPCODE: %d, reserved for future use\n", flags.op_code);
-        break;
-      default:
-        break;
-      }
-    } else {
-      printf("QR: Message is response.\n"); // TODO send refused?
-    }
-
-    if (flags.TC == 0)
-      printf("TC: Message is NOT truncated.\n");
-    else
-      printf("TC: Message is truncated.\n");
-
-    if (flags.RD == 0)
-      printf("RD: Recursion not desired.\n");
-    else
-      printf("RD: Recursion desired.\n");
+    // Detach the thread
+    pthread_detach(tid);
   }
 }
 
