@@ -177,6 +177,7 @@ struct DNS_RR_FLAGS resolve(const char *query, const char *dns_server) {
 
   unsigned char *qname = (unsigned char *)&packet[packet_size];
   change_to_dns_format(input, qname);
+  free(input);
   packet_size = packet_size + (strlen((const char *)qname) + 1);
 
   printf("Adding a query flags...\n");
@@ -194,6 +195,7 @@ struct DNS_RR_FLAGS resolve(const char *query, const char *dns_server) {
   servaddr.sin_family = AF_INET;
   servaddr.sin_port = htons(53); // 53 UDP port for DNS
   inet_pton(AF_INET, resolver, &(servaddr.sin_addr));
+  free(resolver);
 
   // connecting
   printf("Connecting to DNS server...\n");
@@ -206,8 +208,10 @@ struct DNS_RR_FLAGS resolve(const char *query, const char *dns_server) {
   // receive response packet from DNS
   printf("Receiving response packet...\n");
   int received_packet_size = read(sock_fd, (unsigned char *)packet, 65536);
-  if (received_packet_size <= 0)
-    close(sock_fd);
+  if (received_packet_size <= 0) {
+    perror("Error while reading sock_fd");
+  }
+  close(sock_fd);
   printf("Packet size: %d\n", received_packet_size);
   // parsing the header from reply
   printf("Parcing Header from reply...\n");
@@ -288,10 +292,14 @@ struct DNS_RR_FLAGS resolve(const char *query, const char *dns_server) {
   answer_record.RC = header_flags.RC;
   answer_record.packet_size = 0;
   printf("Received packet size: %d\n", received_packet_size);
+  if(received_packet_size < 0) {
+    perror("Error with packet size: ");
+  }
   for (int i = 12, j = 0; i < received_packet_size; i++) {
     answer_record.packet[j++] = packet[i];
     answer_record.packet_size++;
   }
+
   return answer_record;
 }
 
@@ -426,6 +434,7 @@ void *handle_request(void *args) {
             sendto(thread_args->sock_fd, response_packet_start,
                    response_packet - response_packet_start, 0,
                    (struct sockaddr *)&thread_args->client_address, thread_args->client_addr_len);
+        free(response_packet_start);
         if (bytes_sent == -1) {
             perror("Sendto failed");
         }
@@ -468,8 +477,6 @@ void *handle_request(void *args) {
     printf("RD: Recursion not desired.\n");
   else
     printf("RD: Recursion desired.\n");
-
-  // Remember to free any allocated resources and close the socket if needed
 
   // Free the memory allocated for thread arguments
   free(thread_args);
