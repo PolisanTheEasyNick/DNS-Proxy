@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <arpa/inet.h>
 #include <unistd.h>
@@ -11,8 +12,6 @@ struct DNS_HEADER { //RFC1035 4.1.1
     unsigned short an_count; // number of answer entries
     unsigned short ar_count; // number of authority entries
     unsigned short ns_count; // number of resource entries
-
-
 };
 
 struct DNS_QUERY_FLAGS { //RFC1035 4.1.2
@@ -58,11 +57,23 @@ void change_to_dot_format(unsigned char *str) {
     str[i - 1] = '\0';
 }
 
+char* resolve(const char *query, const char* dns_server) {
+    char *input = (char*)malloc((strlen(query) + 1) * sizeof(char));
+    char *resolver = (char*)malloc((strlen(dns_server) + 1) * sizeof(char));
+    if(query) {
+        strcpy(input, query);
+    } else {
+        printf("Error! Query is NULL.\n");
+        return "";
+    }
 
+    if(dns_server) {
+        strcpy(resolver, dns_server);
+    } else {
+        printf("Error! Query is NULL.\n");
+        return "";
+    }
 
-int main()
-{
-    char input[] = "polisan.ddns.net";
     unsigned char packet[65536];
     //building a header for request
     printf("Building a header...\n");
@@ -70,21 +81,17 @@ int main()
     header->id = htons(getpid());
 
     header->flags = 0;
-    header->flags |= 0; //query
+    header->flags |= 0; //query (0) or response (1)
     header->flags <<= 4;
     header->flags |= 0; //opcode
-    header->flags <<= 1;
-    header->flags |= 0; //Authoritative Answer
-    header->flags <<= 1;
-    header->flags |= 0; //TC
+    header->flags <<= 2;
+    header->flags |= 0; //Truncated
     header->flags <<= 1;
     header->flags |= 1; //Recursion Desired
-    header->flags <<= 1;
-    header->flags |= 0; //Recursion Available
-    header->flags <<= 3;
+    header->flags <<= 2;
     header->flags |= 0; //Z
-    header->flags <<= 4;
-    header->flags |= 0; //Response code
+    header->flags <<= 6;
+    header->flags = htons(header->flags);
 
     header->qd_count = htons(1); //only 1 question
     header->an_count = 0x0000;
@@ -110,10 +117,10 @@ int main()
     memset(&servaddr, 0, sizeof(servaddr));
     servaddr.sin_family = AF_INET;
     servaddr.sin_port = htons(53); //53 UDP port for DNS
-    inet_pton(AF_INET, "208.67.222.220", &(servaddr.sin_addr)); //OpenDNS dns server
+    inet_pton(AF_INET, resolver, &(servaddr.sin_addr));
 
     //connecting
-    printf("Connecting to OpenDNS server...\n");
+    printf("Connecting to DNS server...\n");
     connect(sock_fd, (struct sockaddr *) &servaddr, sizeof(servaddr));
 
     //sending query packet to DNS server
@@ -241,8 +248,14 @@ int main()
         }
         sprintf(IP, "%d.%d.%d.%d\0", data[0], data[1], data[2], data[3]);
         printf("IP address: %s\n", IP);
-
+        return IP;
     }
+    return "";
+}
 
+int main()
+{
+
+    resolve("polisan.ddns.net", "8.8.8.8");
     return 0;
 }
