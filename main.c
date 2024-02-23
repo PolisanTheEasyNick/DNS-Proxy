@@ -4,6 +4,91 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <libconfig.h>
+
+struct config conf;
+
+enum Response {
+    NOT_FOUND = 0,
+    REFUSED = 1,
+    RESOLVE = 2
+};
+
+struct config {
+    char upstream_ip[16];
+    char **blacklist;
+    unsigned short blacklist_items;
+    enum Response response_type;
+    char resolve_ip[16]; //ip address to resolve with if domain blacklisted
+};
+
+void load_config(const char *config_file, struct config *conf) {
+    config_t cfg;
+    config_init(&cfg);
+
+    if (!config_read_file(&cfg, config_file)) {
+        fprintf(stderr, "Error reading config file: %s\n", config_error_text(&cfg));
+        config_destroy(&cfg);
+        exit(EXIT_FAILURE);
+    }
+
+    const char *upstream_ip;
+    if (!config_lookup_string(&cfg, "upstream_ip", &upstream_ip)) {
+        fprintf(stderr, "Missing upstream_ip in config file\n");
+        config_destroy(&cfg);
+        exit(EXIT_FAILURE);
+    }
+    strncpy(conf->upstream_ip, upstream_ip, sizeof(conf->upstream_ip));
+
+    const config_setting_t *blacklist = config_lookup(&cfg, "blacklist");
+    int num_blacklist = config_setting_length(blacklist);
+    conf->blacklist = malloc(num_blacklist * sizeof(char *));
+    if (conf->blacklist == NULL) {
+        fprintf(stderr, "Memory allocation error\n");
+        config_destroy(&cfg);
+        exit(EXIT_FAILURE);
+    }
+    conf->blacklist_items = num_blacklist;
+    printf("Num blacklist: %d\n", num_blacklist);
+    for (int i = 0; i < num_blacklist; i++) {
+        const char *domain = config_setting_get_string_elem(blacklist, i);
+        conf->blacklist[i] = strdup(domain);
+    }
+
+    const char *response_type;
+    if (!config_lookup_string(&cfg, "response_type", &response_type)) {
+        fprintf(stderr, "Missing response_type in config file\n");
+        config_destroy(&cfg);
+        exit(EXIT_FAILURE);
+    }
+    if (strcmp(response_type, "NOT_FOUND") == 0) {
+        conf->response_type = NOT_FOUND;
+    } else if (strcmp(response_type, "REFUSED") == 0) {
+        conf->response_type = REFUSED;
+    } else if (strcmp(response_type, "RESOLVE") == 0) {
+        conf->response_type = RESOLVE;
+        const char *resolve_ip;
+        if (!config_lookup_string(&cfg, "resolve_ip", &resolve_ip)) {
+            fprintf(stderr, "Missing resolve_ip in config file\n");
+            config_destroy(&cfg);
+            exit(EXIT_FAILURE);
+        }
+        strncpy(conf->resolve_ip, resolve_ip, sizeof(conf->resolve_ip));
+    } else {
+        fprintf(stderr, "Invalid response_type in config file\n");
+        config_destroy(&cfg);
+        exit(EXIT_FAILURE);
+    }
+
+    config_destroy(&cfg);
+}
+
+void free_config(struct config *conf) {
+    for (int i = 0; conf->blacklist[i] != NULL; i++) {
+        free(conf->blacklist[i]);
+    }
+    free(conf->blacklist);
+}
 
 struct thread_args {
     int sock_fd;
@@ -97,7 +182,10 @@ unsigned short flags_to_header(struct DNS_HEADER_FLAGS flags) {
   return result;
 }
 
-unsigned char *build_dns_response(int mode) {}
+struct response {
+  unsigned char *response;
+  unsigned short size;
+};
 
 void change_to_dns_format(char *src, unsigned char *dest) {
   int pos = 0;
@@ -128,6 +216,52 @@ void change_to_dot_format(unsigned char *str) {
     str[i] = '.';
   }
   str[i - 1] = '\0';
+}
+
+struct response generate_response(struct DNS_HEADER_FLAGS flags, struct DNS_RR_FLAGS answer_record) {
+  // building a response
+  unsigned char *response_packet, *response_packet_start;
+  response_packet = malloc(1024);
+  memset(response_packet, 0, 1024);
+  response_packet_start = response_packet;
+
+  response_packet[0] = answer_record.header.id & 0b11111111;// id
+  response_packet[1] = (answer_record.header.id >> 8) & 0b11111111;
+
+  response_packet += 2;
+
+  unsigned short flags_bits = flags_to_header(flags);
+  response_packet[0] = (flags_bits >> 8) & 0b11111111;
+  response_packet[1] = flags_bits & 0b11111111;
+  response_packet += 2;
+
+  response_packet[0] = 0; // questions
+  response_packet[1] = answer_record.header.qd_count;
+  response_packet += 2;
+
+  response_packet[0] = 0; // answers
+  response_packet[1] = answer_record.header.an_count;
+  response_packet += 2;
+
+  response_packet[0] = 0; // authority RRs
+  response_packet[1] = answer_record.header.ns_count;
+  response_packet += 2;
+
+  response_packet[0] = 0; // additional RRs
+  response_packet[1] = answer_record.header.ar_count;
+  response_packet += 2;
+
+  for (int j = 0; j < answer_record.packet_size; j++) { // copying answer from relay dns response
+    response_packet[0] = answer_record.packet[j];
+    response_packet++;
+  }
+  struct response result;
+  result.size = response_packet - response_packet_start;
+  result.response = malloc(response_packet - response_packet_start);
+  memset(result.response, 0, result.size);
+  memcpy(result.response, response_packet_start, response_packet - response_packet_start);
+
+  return result;
 }
 
 struct DNS_RR_FLAGS resolve(const char *query, const char *dns_server) {
@@ -303,7 +437,6 @@ struct DNS_RR_FLAGS resolve(const char *query, const char *dns_server) {
   return answer_record;
 }
 
-// Define a function to handle client requests
 void *handle_request(void *args) {
   struct thread_args *thread_args = (struct thread_args *)args;
   int sock_fd = thread_args->sock_fd;
@@ -380,61 +513,155 @@ void *handle_request(void *args) {
         change_to_dot_format(cname);
         printf("CNAME: %s\n", cname);
 
-        // TODO: Add blacklist checking
+        for(int i = 0; i < conf.blacklist_items; i++) {
+            if(strstr(cname, conf.blacklist[i])) {
+                printf("Found blacklisted CNAME: %s\n", cname);
+                switch(conf.response_type) {
+                case NOT_FOUND: {
+                    struct DNS_RR_FLAGS answer_record;
+                    answer_record.header.id = request_header.id;
+                    answer_record.header.an_count = 0;
+                    answer_record.header.qd_count = 1;
+                    answer_record.header.ns_count = 0;
+                    answer_record.header.ar_count = 0;
+                    flags.QR = 1;
+                    flags.RA = 1;
+                    flags.RC = 3;
+                    answer_record.RC = 3;
+                    answer_record.packet_size = size_of_cname + 4;
+                    answer_record.packet[size_of_cname] = 0x00; //Type A
+                    answer_record.packet[size_of_cname+1] = 0x01;
+                    answer_record.packet[size_of_cname+2] = 0x00;// Class IN
+                    answer_record.packet[size_of_cname+3] = 0x01;
+                    change_to_dns_format(cname, answer_record.packet);
+                    struct response response = generate_response(flags, answer_record);
+                    printf("Sending result\n");
+                    printf("size: %d\n", response.size);
+                    ssize_t bytes_sent =
+                        sendto(thread_args->sock_fd, response.response,
+                               response.size, 0,
+                               (struct sockaddr *)&thread_args->client_address, thread_args->client_addr_len);
+                    free(response.response);
+                    if (bytes_sent == -1) {
+                        perror("Sendto failed");
+                    }
+                    free(thread_args);
+                    pthread_exit(NULL);
+                    break;
+                }
+                case REFUSED: {
+                    struct DNS_RR_FLAGS answer_record;
+                    answer_record.header.id = request_header.id;
+                    answer_record.header.an_count = 0;
+                    answer_record.header.qd_count = 1;
+                    answer_record.header.ns_count = 0;
+                    answer_record.header.ar_count = 0;
+                    flags.QR = 1;
+                    flags.RA = 1;
+                    flags.RC = 5;
+                    answer_record.RC = 5;
+                    answer_record.packet_size = size_of_cname + 4;
+                    answer_record.packet[size_of_cname] = 0x00; //Type A
+                    answer_record.packet[size_of_cname+1] = 0x01;
+                    answer_record.packet[size_of_cname+2] = 0x00;// Class IN
+                    answer_record.packet[size_of_cname+3] = 0x01;
+                    change_to_dns_format(cname, answer_record.packet);
+                    struct response response = generate_response(flags, answer_record);
+                    printf("Sending result\n");
+                    printf("size: %d\n", response.size);
+                    ssize_t bytes_sent =
+                        sendto(thread_args->sock_fd, response.response,
+                               response.size, 0,
+                               (struct sockaddr *)&thread_args->client_address, thread_args->client_addr_len);
+                    free(response.response);
+                    if (bytes_sent == -1) {
+                        perror("Sendto failed");
+                    }
+                    free(thread_args);
+                    pthread_exit(NULL);
+                    break;
+                }
+                case RESOLVE: {
+                    struct DNS_RR_FLAGS answer_record;
+                    answer_record.header.id = request_header.id;
+                    answer_record.header.an_count = 1; //one answer
+                    answer_record.header.qd_count = 1;
+                    answer_record.header.ns_count = 0;
+                    answer_record.header.ar_count = 0;
+                    flags.QR = 1;
+                    flags.RA = 1;
+                    flags.RC = 0;
+                    answer_record.RC = 0;
+                    change_to_dns_format(cname, answer_record.packet);
+                    answer_record.packet_size = size_of_cname + 20;
+                    answer_record.packet[size_of_cname] = 0x00; //Type A
+                    answer_record.packet[size_of_cname+1] = 0x01;
+                    answer_record.packet[size_of_cname+2] = 0x00;// Class IN
+                    answer_record.packet[size_of_cname+3] = 0x01;
+
+                    //adding response
+                    answer_record.packet[size_of_cname+4] = 0xc0;
+                    answer_record.packet[size_of_cname+5] = 0x0c;
+
+                    answer_record.packet[size_of_cname+6] = 0x00;
+                    answer_record.packet[size_of_cname+7] = 0x01; //Type A
+
+                    answer_record.packet[size_of_cname+8] = 0x00;
+                    answer_record.packet[size_of_cname+9] = 0x01; //Class IN
+
+                    answer_record.packet[size_of_cname+10] = 0x00; //TTL
+                    answer_record.packet[size_of_cname+11] = 0x00;
+                    answer_record.packet[size_of_cname+12] = 0x01; //5 minutes (300 secs)
+                    answer_record.packet[size_of_cname+13] = 0x2c;
+
+                    answer_record.packet[size_of_cname+14] = 0x00;
+                    answer_record.packet[size_of_cname+15] = 0x04; //Data length: 4
+
+                    sscanf(conf.resolve_ip, "%d.%d.%d.%d",
+                           &answer_record.packet[size_of_cname+16],
+                           &answer_record.packet[size_of_cname+17],
+                           &answer_record.packet[size_of_cname+18],
+                           &answer_record.packet[size_of_cname+19]);
+
+                    struct response response = generate_response(flags, answer_record);
+                    printf("Sending result\n");
+                    printf("size: %d\n", response.size);
+                    ssize_t bytes_sent =
+                        sendto(thread_args->sock_fd, response.response,
+                               response.size, 0,
+                               (struct sockaddr *)&thread_args->client_address, thread_args->client_addr_len);
+                    free(response.response);
+                    if (bytes_sent == -1) {
+                        perror("Sendto failed");
+                    }
+                    free(thread_args);
+                    pthread_exit(NULL);
+                    break;
+                }
+
+                }
+            }
+        }
 
         // got CNAME, sending to RELAY
-        struct DNS_RR_FLAGS answer_record = resolve(cname, "8.8.8.8");
+        struct DNS_RR_FLAGS answer_record = resolve(cname, conf.upstream_ip);
+        answer_record.header.qd_count = request_header.qd_count;
+        answer_record.header.id = request_header.id;
         printf("IP: %s\n", answer_record.ip);
 
         free(answer_record.ip);
-
-        // building a response
-        request_header.an_count = answer_record.header.an_count;
         flags.QR = 1; // response
         flags.RA = 1; // recursion is available
         flags.RC = answer_record.RC;
-        unsigned char *response_packet, *response_packet_start;
-        response_packet = malloc(1024);
-        memset(response_packet, 0, 1024);
-        response_packet_start = response_packet;
+        struct response response = generate_response(flags, answer_record);
 
-        response_packet[0] = request_header.id & 0b11111111;// id
-        response_packet[1] = (request_header.id >> 8) & 0b11111111;
-
-        response_packet += 2;
-
-        unsigned short flags_bits = flags_to_header(flags);
-        response_packet[0] = (flags_bits >> 8) & 0b11111111;
-        response_packet[1] = flags_bits & 0b11111111;
-        response_packet += 2;
-
-        response_packet[0] = thread_args->packet[4]; // questions
-        response_packet[1] = thread_args->packet[5];
-        response_packet += 2;
-
-        response_packet[0] = 0; // answers
-        response_packet[1] = answer_record.header.an_count;
-        response_packet += 2;
-
-        response_packet[0] = 0; // authority RRs
-        response_packet[1] = answer_record.header.ns_count;
-        response_packet += 2;
-
-        response_packet[0] = 0; // additional RRs
-        response_packet[1] = answer_record.header.ar_count;
-        response_packet += 2;
-
-        for (int j = 0; j < answer_record.packet_size; j++) { // copying answer from relay dns response
-            response_packet[0] = answer_record.packet[j];
-            response_packet++;
-        }
         printf("Sending result\n");
-        printf("size: %d\n", (int)(response_packet - response_packet_start));
+        printf("size: %d\n", response.size);
         ssize_t bytes_sent =
-            sendto(thread_args->sock_fd, response_packet_start,
-                   response_packet - response_packet_start, 0,
+            sendto(thread_args->sock_fd, response.response,
+                   response.size, 0,
                    (struct sockaddr *)&thread_args->client_address, thread_args->client_addr_len);
-        free(response_packet_start);
+        free(response.response);
         if (bytes_sent == -1) {
             perror("Sendto failed");
         }
@@ -478,10 +705,7 @@ void *handle_request(void *args) {
   else
     printf("RD: Recursion desired.\n");
 
-  // Free the memory allocated for thread arguments
   free(thread_args);
-
-  // Exit the thread
   pthread_exit(NULL);
 }
 
@@ -511,7 +735,6 @@ void server() {
 
 
   while (1) {
-    // Receive request from client
     unsigned char packet[65536];
     struct sockaddr_in client_address;
     socklen_t client_addr_len = sizeof(client_address);
@@ -521,7 +744,6 @@ void server() {
       continue;
     }
 
-    // Create thread arguments
     struct thread_args *thread_args = malloc(sizeof(struct thread_args));
     if (thread_args == NULL) {
       perror("Memory allocation failed");
@@ -533,7 +755,6 @@ void server() {
     thread_args->client_addr_len = client_addr_len;
     memcpy(&thread_args->packet, &packet, sizeof(packet));
 
-    // Create a new thread to handle the request
     pthread_t tid;
     int ret = pthread_create(&tid, NULL, handle_request, (void *)thread_args);
     if (ret != 0) {
@@ -548,7 +769,19 @@ void server() {
 }
 
 int main() {
+  load_config("../DNS-Proxy/config.conf", &conf);
+
+  printf("upstream_ip: %s\n", conf.upstream_ip);
+  printf("blacklist:\n");
+  for (int i = 0; i < conf.blacklist_items; i++) {
+    printf("  %s\n", conf.blacklist[i]);
+  }
+  printf("response_type: %d\n", conf.response_type);
+  printf("resolve_ip: %s\n", conf.resolve_ip);
+
   // resolve("polisan.ddns.net", "8.8.8.8");
   server();
+
+  free_config(&conf);
   return 0;
 }
