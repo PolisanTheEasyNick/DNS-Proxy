@@ -8,6 +8,7 @@ libconfig library
 
 # Building and running
 ```bash
+$ cmake .
 $ make
 $ sudo ./DNS-Proxy
 ```
