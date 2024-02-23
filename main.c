@@ -42,7 +42,7 @@ void load_config(const char *config_file, struct config *conf) {
 
     const config_setting_t *blacklist = config_lookup(&cfg, "blacklist");
     int num_blacklist = config_setting_length(blacklist);
-    conf->blacklist = malloc(num_blacklist * sizeof(char *));
+    conf->blacklist = malloc(num_blacklist * 253 * sizeof(char *));
     if (conf->blacklist == NULL) {
         fprintf(stderr, "Memory allocation error\n");
         config_destroy(&cfg);
@@ -84,7 +84,7 @@ void load_config(const char *config_file, struct config *conf) {
 }
 
 void free_config(struct config *conf) {
-    for (int i = 0; conf->blacklist[i] != NULL; i++) {
+    for (int i = 0; i < conf->blacklist_items; i++) {
         free(conf->blacklist[i]);
     }
     free(conf->blacklist);
@@ -205,7 +205,7 @@ void change_to_dns_format(char *src, unsigned char *dest) {
   dest[pos] = '\0';
 }
 
-void change_to_dot_format(unsigned char *str) {
+void change_to_dot_format(char *str) {
   int i;
   for (i = 0; i < strlen((const char *)str); ++i) {
     unsigned int len = str[i];
@@ -408,8 +408,8 @@ struct DNS_RR_FLAGS resolve(const char *query, const char *dns_server) {
     for (int j = 12; packet[j] != 0; j++) {
       size_of_qname++;
     }
-    unsigned char qname[size_of_qname];
-    unsigned char *qname_ptr = &qname[0];
+    char qname[size_of_qname];
+    char *qname_ptr = &qname[0];
     for (int j = 12; j < 12 + size_of_qname; j++) {
       *qname_ptr++ = packet[j];
     }
@@ -440,8 +440,6 @@ struct DNS_RR_FLAGS resolve(const char *query, const char *dns_server) {
 void *handle_request(void *args) {
   struct thread_args *thread_args = (struct thread_args *)args;
   int sock_fd = thread_args->sock_fd;
-  struct sockaddr_in client_address = thread_args->client_address;
-  socklen_t client_addr_len = thread_args->client_addr_len;
   if (thread_args->bytes_received == -1) {
     printf("Recvfrom failed.\n");
     close(sock_fd);
@@ -449,8 +447,8 @@ void *handle_request(void *args) {
   }
 
   thread_args->packet[thread_args->bytes_received] = '\0';
-  printf("Received from %s:%d\n", inet_ntoa(client_address.sin_addr),
-         ntohs(client_address.sin_port));
+  printf("Received from %s:%d\n", inet_ntoa(thread_args->client_address.sin_addr),
+         ntohs(thread_args->client_address.sin_port));
 
   struct DNS_HEADER request_header;
   request_header.id = 0;
@@ -505,8 +503,8 @@ void *handle_request(void *args) {
         for (int j = 12; thread_args->packet[j] != 0; j++) {
             size_of_cname++;
         }
-        unsigned char cname[size_of_cname];
-        unsigned char *cname_ptr = &cname[0];
+        char cname[size_of_cname];
+        char *cname_ptr = &cname[0];
         for (int j = 12; j < 12 + size_of_cname; j++) {
             *cname_ptr++ = thread_args->packet[j];
         }
@@ -768,8 +766,25 @@ void server() {
   }
 }
 
-int main() {
-  load_config("../DNS-Proxy/config.conf", &conf);
+int main(int argc, char *argv[]) {
+
+  if (argc == 1) {
+    // No command-line arguments specified, try loading config from the current folder
+    if (access("config.conf", F_OK) == 0) {
+      load_config("config.conf", &conf);
+    } else {
+      // Configuration file not found in the current folder
+      printf("Can't load config.conf from current folder.\nDNS-Proxy: Usage: -c <config_file_path>\n");
+      return 1;
+    }
+  } else if (argc == 3 && strcmp(argv[1], "-c") == 0) {
+    // Command-line argument specified, check if it's "-c" followed by a file path
+    load_config(argv[2], &conf);
+  } else {
+    // Invalid command-line arguments
+    printf("DNS-Proxy: Usage: -c <config_file_path>\n");
+    return 1;
+  }
 
   printf("upstream_ip: %s\n", conf.upstream_ip);
   printf("blacklist:\n");
