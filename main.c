@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <libconfig.h>
+#include <time.h> //for packet id generation
 
 struct config conf;
 
@@ -85,9 +86,11 @@ void load_config(const char *config_file, struct config *conf) {
 
 void free_config(struct config *conf) {
     for (int i = 0; i < conf->blacklist_items; i++) {
-        free(conf->blacklist[i]);
+        if(conf->blacklist[i])
+          free(conf->blacklist[i]);
     }
-    free(conf->blacklist);
+    if(conf->blacklist)
+      free(conf->blacklist);
 }
 
 struct thread_args {
@@ -95,7 +98,7 @@ struct thread_args {
     struct sockaddr_in client_address;
     socklen_t client_addr_len;
     ssize_t bytes_received;
-    unsigned char packet[65536];
+    unsigned char packet[1024];
 };
 
 struct DNS_HEADER {  // RFC1035 4.1.1
@@ -160,25 +163,40 @@ struct DNS_HEADER_FLAGS parse_header_flags(unsigned short flags) {
 
 unsigned short flags_to_header(struct DNS_HEADER_FLAGS flags) {
   unsigned short result = 0;
-  result |= flags.QR;
-  result <<= 4;
-  result |= flags.op_code;
-  result <<= 1;
-  result |= flags.AA;
-  result <<= 1;
-  result |= flags.TC;
-  result <<= 1;
-  result |= flags.RD;
-  result <<= 1;
-  result |= flags.RA;
-  result <<= 1;
-  result |= flags.Z;
-  result <<= 1;
-  result |= flags.AnswAuth;
-  result <<= 1;
-  result |= flags.NA;
-  result <<= 4;
-  result |= flags.RC;
+  if(flags.QR == 0) { //query
+      result |= flags.QR;
+      result <<= 4;
+      result |= flags.op_code;
+      result <<= 2; //2 because AA skipped for query type
+      result |= flags.TC;
+      result <<= 1;
+      result |= flags.RD;
+      result <<= 2;
+      result |= flags.Z;
+      result <<= 2;
+      result |= flags.NA;
+      result <<= 4;
+  } else { //means response
+      result |= flags.QR;
+      result <<= 4;
+      result |= flags.op_code;
+      result <<= 1;
+      result |= flags.AA;
+      result <<= 1;
+      result |= flags.TC;
+      result <<= 1;
+      result |= flags.RD;
+      result <<= 1;
+      result |= flags.RA;
+      result <<= 1;
+      result |= flags.Z;
+      result <<= 1;
+      result |= flags.AnswAuth;
+      result <<= 1;
+      result |= flags.NA;
+      result <<= 4;
+      result |= flags.RC;
+  }
   return result;
 }
 
@@ -188,26 +206,28 @@ struct response {
 };
 
 void change_to_dns_format(char *src, unsigned char *dest) {
-  int pos = 0;
-  int len = 0;
-  strcat(src, ".");
-  for (int i = 0; i < (int)strlen(src); ++i) {
-    if (src[i] == '.') {
-      dest[pos] = i - len;
-      ++pos;
-      for (; len < i; ++len) {
-        dest[pos] = src[len];
-        ++pos;
+  int inputLength = strlen(src);
+  int dnsIndex = 0;
+  int labelLength = 0;
+
+  for (int i = 0; i <= inputLength; i++) {
+      if (src[i] == '.' || src[i] == '\0') {
+          dest[dnsIndex++] = labelLength;
+          for (int j = i - labelLength; j < i; j++) {
+              dest[dnsIndex++] = src[j];
+          }
+          labelLength = 0;
+      } else {
+          labelLength++;
       }
-      len++;
-    }
   }
-  dest[pos] = '\0';
+
+  dest[dnsIndex] = '\0';
 }
 
 void change_to_dot_format(char *str) {
   int i;
-  for (i = 0; i < strlen((const char *)str); ++i) {
+  for (i = 0; i < strlen((const char*)str); ++i) {
     unsigned int len = str[i];
     for (int j = 0; j < len; ++j) {
       str[i] = str[i + 1];
@@ -260,13 +280,12 @@ struct response generate_response(struct DNS_HEADER_FLAGS flags, struct DNS_RR_F
   result.response = malloc(response_packet - response_packet_start);
   memset(result.response, 0, result.size);
   memcpy(result.response, response_packet_start, response_packet - response_packet_start);
-
+  free(response_packet_start);
   return result;
 }
 
 struct DNS_RR_FLAGS resolve(const char *query, const char *dns_server) {
   char *input = (char *)malloc((strlen(query) + 1) * sizeof(char));
-  char *resolver = (char *)malloc((strlen(dns_server) + 1) * sizeof(char));
   if (query) {
     strcpy(input, query);
   } else {
@@ -275,51 +294,72 @@ struct DNS_RR_FLAGS resolve(const char *query, const char *dns_server) {
     return answer_record; // empty?
   }
 
-  if (dns_server) {
-    strcpy(resolver, dns_server);
-  } else {
-    printf("Error! Query is NULL.\n");
-    struct DNS_RR_FLAGS answer_record;
-    return answer_record; // empty?
-  }
+  unsigned char *packet = malloc(1024);
+  memset(packet, 0, 1024);
+  unsigned char *packet_start = packet;
 
-  unsigned char packet[65536];
   // building a header for request
   printf("Building a header...\n");
-  struct DNS_HEADER *header = (struct DNS_HEADER *)&packet;
-  header->id = htons(getpid());
 
-  header->flags = 0;
-  header->flags |= 0; // query (0) or response (1)
-  header->flags <<= 4;
-  header->flags |= 0; // opcode
-  header->flags <<= 2;
-  header->flags |= 0; // Truncated
-  header->flags <<= 1;
-  header->flags |= 1; // Recursion Desired
-  header->flags <<= 2;
-  header->flags |= 0; // Z
-  header->flags <<= 6;
-  header->flags = htons(header->flags);
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
 
-  header->qd_count = htons(1); // only 1 question
-  header->an_count = 0x0000;
-  header->ns_count = 0x0000;
-  header->ar_count = 0x0000;
 
-  int packet_size = sizeof(struct DNS_HEADER);
+  packet[0] = (ts.tv_nsec % 65535) & 0b11111111; //id
+  packet[1] = ((ts.tv_nsec % 65535) >> 8) & 0b11111111;
+  packet += 2;
 
-  unsigned char *qname = (unsigned char *)&packet[packet_size];
+  struct DNS_HEADER_FLAGS flags;
+  flags.QR = 0; //query
+  flags.op_code = 0b0000; //standart query (0)
+  flags.TC = 0; //not truncated
+  flags.RD = 1; //recursion desired
+  flags.Z = 0;
+  flags.NA = 0;
+
+  unsigned short flags_bits = flags_to_header(flags);
+  packet[0] = (flags_bits >> 8) & 0b11111111;
+  packet[1] = flags_bits & 0b11111111;
+  packet += 2;
+
+  packet[0] = 0; // questions
+  packet[1] = 1;
+  packet += 2;
+
+
+  packet[0] = 0; // answers
+  packet[1] = 0;
+  packet += 2;
+
+  packet[0] = 0; // authority RRs
+  packet[1] = 0;
+  packet += 2;
+
+  packet[0] = 0; // additional RRs
+  packet[1] = 0;
+  packet += 2;
+
+  int qname_size = strlen(input) + 2; //size of dns's query format
+  unsigned char *qname = malloc(qname_size); //writing qname
   change_to_dns_format(input, qname);
-  free(input);
-  packet_size = packet_size + (strlen((const char *)qname) + 1);
+  if(input)
+    free(input);
 
-  printf("Adding a query flags...\n");
-  struct DNS_QUERY_FLAGS *query_flags =
-      (struct DNS_QUERY_FLAGS *)&packet[packet_size];
-  query_flags->qclass = htons(0x0001);
-  query_flags->qtype = htons(0x0001);
-  packet_size = packet_size + sizeof(struct DNS_QUERY_FLAGS);
+  for(int i = 0; i < qname_size; i++) {
+    packet[0] = qname[i];
+    packet++;
+  }
+
+  free(qname);
+
+  packet[0] = 0; //Type: A
+  packet[1] = 1;
+  packet += 2;
+
+  packet[0] = 0; //Class: In
+  packet[1] = 1;
+  packet += 2;
+
 
   // creating socket for connecting to DNS
   printf("Creating socket...\n");
@@ -328,8 +368,7 @@ struct DNS_RR_FLAGS resolve(const char *query, const char *dns_server) {
   memset(&servaddr, 0, sizeof(servaddr));
   servaddr.sin_family = AF_INET;
   servaddr.sin_port = htons(53); // 53 UDP port for DNS
-  inet_pton(AF_INET, resolver, &(servaddr.sin_addr));
-  free(resolver);
+  inet_pton(AF_INET, dns_server, &(servaddr.sin_addr));
 
   // connecting
   printf("Connecting to DNS server...\n");
@@ -337,11 +376,13 @@ struct DNS_RR_FLAGS resolve(const char *query, const char *dns_server) {
 
   // sending query packet to DNS server
   printf("Sending query packet to DNS server...\n");
-  write(sock_fd, (unsigned char *)packet, packet_size);
+  write(sock_fd, packet_start, packet - packet_start);
 
   // receive response packet from DNS
   printf("Receiving response packet...\n");
-  int received_packet_size = read(sock_fd, (unsigned char *)packet, 65536);
+  packet = packet_start;
+  memset(packet, 0, 1024);
+  int received_packet_size = read(sock_fd, packet, 1024);
   if (received_packet_size <= 0) {
     perror("Error while reading sock_fd");
   }
@@ -354,12 +395,12 @@ struct DNS_RR_FLAGS resolve(const char *query, const char *dns_server) {
   response_header.id |= packet[1];
   response_header.id <<= 8;
   response_header.id |= packet[0];
-  if (response_header.id == header->id) {
+  if (response_header.id == ts.tv_nsec % 65535) {
     printf("Response header ID is same as request header ID: %d.\n",
            response_header.id);
   } else {
-    printf("Response ID and request ID is NOT same: %d and %d!\n",
-           response_header.id, header->id);
+    printf("Response ID and request ID is NOT same: %d and %ld!\n",
+           response_header.id, ts.tv_nsec % 65535);
   }
 
   printf("Parcing flags from Header reply...\n");
@@ -411,7 +452,7 @@ struct DNS_RR_FLAGS resolve(const char *query, const char *dns_server) {
     char qname[size_of_qname];
     char *qname_ptr = &qname[0];
     for (int j = 12; j < 12 + size_of_qname; j++) {
-      *qname_ptr++ = packet[j];
+      *qname_ptr++ = packet_start[j];
     }
     change_to_dot_format(qname);
     printf("QNAME: %s\n", qname);
@@ -433,7 +474,7 @@ struct DNS_RR_FLAGS resolve(const char *query, const char *dns_server) {
     answer_record.packet[j++] = packet[i];
     answer_record.packet_size++;
   }
-
+  free(packet_start);
   return answer_record;
 }
 
@@ -443,10 +484,10 @@ void *handle_request(void *args) {
   if (thread_args->bytes_received == -1) {
     printf("Recvfrom failed.\n");
     close(sock_fd);
+    free_config(&conf);
     exit(EXIT_FAILURE);
   }
 
-  thread_args->packet[thread_args->bytes_received] = '\0';
   printf("Received from %s:%d\n", inet_ntoa(thread_args->client_address.sin_addr),
          ntohs(thread_args->client_address.sin_port));
 
@@ -539,11 +580,13 @@ void *handle_request(void *args) {
                         sendto(thread_args->sock_fd, response.response,
                                response.size, 0,
                                (struct sockaddr *)&thread_args->client_address, thread_args->client_addr_len);
-                    free(response.response);
+                    if(response.response)
+                      free(response.response);
                     if (bytes_sent == -1) {
                         perror("Sendto failed");
                     }
-                    free(thread_args);
+                    if(thread_args)
+                      free(thread_args);
                     pthread_exit(NULL);
                     break;
                 }
@@ -571,11 +614,14 @@ void *handle_request(void *args) {
                         sendto(thread_args->sock_fd, response.response,
                                response.size, 0,
                                (struct sockaddr *)&thread_args->client_address, thread_args->client_addr_len);
-                    free(response.response);
+
+                    if(response.response)
+                      free(response.response);
                     if (bytes_sent == -1) {
                         perror("Sendto failed");
                     }
-                    free(thread_args);
+                    if(thread_args)
+                      free(thread_args);
                     pthread_exit(NULL);
                     break;
                 }
@@ -628,11 +674,13 @@ void *handle_request(void *args) {
                         sendto(thread_args->sock_fd, response.response,
                                response.size, 0,
                                (struct sockaddr *)&thread_args->client_address, thread_args->client_addr_len);
-                    free(response.response);
+                    if(response.response)
+                      free(response.response);
                     if (bytes_sent == -1) {
                         perror("Sendto failed");
                     }
-                    free(thread_args);
+                    if(thread_args)
+                      free(thread_args);
                     pthread_exit(NULL);
                     break;
                 }
@@ -645,9 +693,10 @@ void *handle_request(void *args) {
         struct DNS_RR_FLAGS answer_record = resolve(cname, conf.upstream_ip);
         answer_record.header.qd_count = request_header.qd_count;
         answer_record.header.id = request_header.id;
-        printf("IP: %s\n", answer_record.ip);
+        // printf("IP: %s\n", answer_record.ip);
 
-        free(answer_record.ip);
+        // if(answer_record.ip)
+        //   free(answer_record.ip);
         flags.QR = 1; // response
         flags.RA = 1; // recursion is available
         flags.RC = answer_record.RC;
@@ -659,7 +708,8 @@ void *handle_request(void *args) {
             sendto(thread_args->sock_fd, response.response,
                    response.size, 0,
                    (struct sockaddr *)&thread_args->client_address, thread_args->client_addr_len);
-        free(response.response);
+        if(response.response)
+          free(response.response);
         if (bytes_sent == -1) {
             perror("Sendto failed");
         }
@@ -703,7 +753,8 @@ void *handle_request(void *args) {
   else
     printf("RD: Recursion desired.\n");
 
-  free(thread_args);
+  if(thread_args)
+    free(thread_args);
   pthread_exit(NULL);
 }
 
@@ -713,6 +764,7 @@ void server() {
   long sock_fd = socket(AF_INET, SOCK_DGRAM, 0); // udp connection
   if (sock_fd == -1) {
     printf("Socket creation failed.\n");
+    free_config(&conf);
     exit(EXIT_FAILURE);
   }
 
@@ -726,23 +778,24 @@ void server() {
            sizeof(server_address)) == -1) {
     perror("Bind failed");
     close(sock_fd);
+    free_config(&conf);
     exit(EXIT_FAILURE);
   }
 
   printf("Listening on port 53...\n");
 
-
   while (1) {
-    unsigned char packet[65536];
     struct sockaddr_in client_address;
     socklen_t client_addr_len = sizeof(client_address);
-    ssize_t bytes_received = recvfrom(sock_fd, packet, sizeof(packet), 0, (struct sockaddr *)&client_address, &client_addr_len);
+    struct thread_args *thread_args = malloc(sizeof(struct thread_args));
+
+    ssize_t bytes_received = recvfrom(sock_fd, &thread_args->packet, 1024, 0, (struct sockaddr *)&client_address, &client_addr_len);
     if (bytes_received == -1) {
       perror("recvfrom failed");
       continue;
     }
 
-    struct thread_args *thread_args = malloc(sizeof(struct thread_args));
+
     if (thread_args == NULL) {
       perror("Memory allocation failed");
       continue;
@@ -751,17 +804,16 @@ void server() {
     thread_args->bytes_received = bytes_received;
     thread_args->client_address = client_address;
     thread_args->client_addr_len = client_addr_len;
-    memcpy(&thread_args->packet, &packet, sizeof(packet));
 
     pthread_t tid;
     int ret = pthread_create(&tid, NULL, handle_request, (void *)thread_args);
     if (ret != 0) {
       perror("Thread creation failed");
-      free(thread_args);
+      if(thread_args)
+        free(thread_args);
       continue;
     }
 
-    // Detach the thread
     pthread_detach(tid);
   }
 }
@@ -769,19 +821,19 @@ void server() {
 int main(int argc, char *argv[]) {
 
   if (argc == 1) {
-    // No command-line arguments specified, try loading config from the current folder
+    //no command-line arguments specified, try loading config from the current folder
     if (access("config.conf", F_OK) == 0) {
       load_config("config.conf", &conf);
     } else {
-      // Configuration file not found in the current folder
+      //configuration file not found in the current folder
       printf("Can't load config.conf from current folder.\nDNS-Proxy: Usage: -c <config_file_path>\n");
       return 1;
     }
   } else if (argc == 3 && strcmp(argv[1], "-c") == 0) {
-    // Command-line argument specified, check if it's "-c" followed by a file path
+    //command-line argument specified, check if it's "-c" followed by a file path
     load_config(argv[2], &conf);
   } else {
-    // Invalid command-line arguments
+    //invalid command-line arguments
     printf("DNS-Proxy: Usage: -c <config_file_path>\n");
     return 1;
   }
@@ -794,7 +846,7 @@ int main(int argc, char *argv[]) {
   printf("response_type: %d\n", conf.response_type);
   printf("resolve_ip: %s\n", conf.resolve_ip);
 
-  // resolve("polisan.ddns.net", "8.8.8.8");
+  //resolve("polisan.ddns.net", "8.8.8.8");
   server();
 
   free_config(&conf);
